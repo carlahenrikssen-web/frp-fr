@@ -8,6 +8,7 @@ import logging
 import time
 from typing import Dict, List, Optional, Callable, Any
 
+from ..core.config import Config
 from ..core.device_manager import DeviceInfo, DeviceManager
 from .types import BypassResult, BypassMethod
 from .adb_exploits import ADBExploitManager
@@ -19,9 +20,9 @@ from ..ai.ai_engine import AIEngine, DeviceProfile
 class BypassManager:
     """Main bypass coordination class"""
     
-    def __init__(self, config, device_manager: DeviceManager):
-        self.config = config
-        self.device_manager = device_manager
+    def __init__(self, config=None, device_manager: DeviceManager = None):
+        self.config = config or Config()
+        self.device_manager = device_manager or DeviceManager(self.config)
         self.logger = logging.getLogger(__name__)
         
         # Initialize exploit managers
@@ -140,6 +141,17 @@ class BypassManager:
                 requirements=["Samsung device", "Setup wizard", "Precise timing"],
                 supported_devices=["Samsung Galaxy A04", "Samsung Galaxy S24", "Samsung"],
                 android_versions=["14.0", "15.0"]
+            ),
+            BypassMethod(
+                name="tcl_manual_recovery_reset",
+                description="TCL recovery-mode factory reset guidance",
+                category="interface",
+                risk_level="low",
+                success_rate=0.95,
+                estimated_time=5,
+                requirements=["Physical buttons", "Recovery menu", "Wipe data/factory reset"],
+                supported_devices=["TCL", "Alcatel", "TracFone"],
+                android_versions=[]
             )
         ])
         
@@ -282,14 +294,30 @@ class BypassManager:
             # Allow interface and some system methods
             if method.category not in ['interface', 'system']:
                 return False
+
+        # MTP confirms the phone is connected, but it does not provide shell or
+        # UI control. Only show methods that are explicit manual guidance.
+        if device.connection_type == 'mtp':
+            device_text = ' '.join(
+                str(getattr(device, field, '')).lower()
+                for field in ('manufacturer', 'brand', 'model', 'product', 'device')
+            )
+            return (
+                method.name == 'tcl_manual_recovery_reset'
+                and any(name in device_text for name in ('tcl', 'alcatel', 'tracfone'))
+            )
         
         # Check manufacturer (skip for unknown devices)
-        if device.manufacturer != "Unknown" and device.manufacturer.lower() not in [d.lower() for d in method.supported_devices]:
+        if device.manufacturer != "Unknown" and not any(
+            device.manufacturer.lower() in supported.lower()
+            or supported.lower() in device.manufacturer.lower()
+            for supported in method.supported_devices
+        ):
             return False
         
         # Check Android version (skip for unknown versions OR restricted devices)
         # For restricted devices, we can't determine Android version, so allow all methods
-        if device.android_version != "Unknown" and device.connection_type not in ['adb_restricted', 'adb_unauthorized']:
+        if method.android_versions and device.android_version != "Unknown" and device.connection_type not in ['adb_restricted', 'adb_unauthorized']:
             device_version = device.android_version
             if device_version not in method.android_versions:
                 # Try to match major version
@@ -505,7 +533,16 @@ class BypassManager:
     def get_ai_device_analysis(self, device: DeviceInfo) -> Dict[str, Any]:
         """Get comprehensive AI analysis of the device"""
         device_profile = self.ai_engine.analyze_device(device)
-        
+        security_assessment = self._get_security_assessment_text(device_profile.vulnerability_score)
+        bypass_strategy = self._get_bypass_strategy(device_profile)
+        profile = {
+            'frp_complexity': device_profile.frp_complexity,
+            'complexity_score': device_profile.complexity_score,
+            'vulnerability_score': device_profile.vulnerability_score,
+            'recommended_methods': device_profile.recommended_methods,
+            'success_probabilities': device_profile.success_probability,
+        }
+
         return {
             'device_info': {
                 'brand': device.brand,
@@ -514,13 +551,15 @@ class BypassManager:
                 'security_patch': device.security_patch
             },
             'ai_analysis': {
-                'complexity_score': device_profile.complexity_score,
-                'vulnerability_score': device_profile.vulnerability_score,
-                'recommended_methods': device_profile.recommended_methods,
-                'success_probabilities': device_profile.success_probability,
-                'security_assessment': self._get_security_assessment_text(device_profile.vulnerability_score),
-                'bypass_strategy': self._get_bypass_strategy(device_profile)
-            }
+                **profile,
+                'security_assessment': security_assessment,
+                'bypass_strategy': bypass_strategy,
+            },
+            # Keep the shape consumed by the method-selection UI and older
+            # integrations while retaining the original ai_analysis payload.
+            'device_profile': profile,
+            'security_assessment': security_assessment,
+            'bypass_strategy': bypass_strategy,
         }
     
     def _get_security_assessment_text(self, vulnerability_score: float) -> str:
@@ -536,6 +575,11 @@ class BypassManager:
     
     def _get_bypass_strategy(self, profile: DeviceProfile) -> str:
         """Generate bypass strategy recommendation"""
+        if profile.recommended_methods == ['tcl_manual_recovery_reset']:
+            return (
+                "Use the TCL recovery menu to erase the device. "
+                "This removes local data but does not remove Google FRP."
+            )
         if profile.complexity_score < 0.3:
             return "Start with interface-based methods, then try ADB exploits"
         elif profile.complexity_score < 0.7:

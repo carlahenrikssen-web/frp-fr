@@ -197,7 +197,22 @@ class MethodSelectionFrame(ttk.Frame):
         """Load available methods for the selected device"""
         try:
             self.available_methods = self.bypass_manager.get_recommended_methods(self.device)
+            device_text = ' '.join(
+                str(getattr(self.device, field, '')).lower()
+                for field in ('manufacturer', 'brand', 'model', 'product', 'device')
+            )
             self.populate_method_tree()
+            # MTP-only TCL devices have a single safe, manual recovery action.
+            # Select it immediately so the user does not need a network/AI step
+            # to proceed through the recovery wizard.
+            if (
+                self.device.connection_type == 'mtp'
+                and any(name in device_text for name in ('tcl', 'alcatel', 'tracfone'))
+                and self.available_methods
+            ):
+                self.selected_methods = [self.available_methods[0]]
+                self._mark_selected_methods()
+                self.update_selection_display()
             self.logger.info(f"Loaded {len(self.available_methods)} methods for device {self.device.serial}")
         except Exception as e:
             self.logger.error(f"Failed to load methods: {e}")
@@ -303,6 +318,10 @@ RECOMMENDATIONS
         
         self.ai_text.insert('1.0', analysis_text)
         self.ai_text.configure(state='disabled')
+
+        # Analysis completion should also select its recommendations. This
+        # keeps the action button and the method table in the same state.
+        self.select_recommended(show_message=False)
         
         # Switch to AI tab
         self.notebook.select(1)
@@ -383,7 +402,7 @@ REQUIREMENTS
         selection = self.method_tree.selection()
         if selection:
             item = selection[0]
-            method_name = self.method_tree.item(item)['values'][0]
+            method_name = str(self.method_tree.item(item)['values'][0]).replace('✓ ', '')
             method = next((m for m in self.available_methods if m.name == method_name), None)
             
             if method:
@@ -396,22 +415,22 @@ REQUIREMENTS
                 
                 self.update_selection_display()
     
-    def select_recommended(self):
+    def select_recommended(self, show_message=True):
         """Select AI recommended methods"""
         if not self.ai_analysis or 'device_profile' not in self.ai_analysis:
-            messagebox.showinfo("Info", "Please run AI analysis first to get recommendations.")
+            if self.available_methods:
+                self.selected_methods = self.available_methods[:1]
+                self._mark_selected_methods()
+                self.update_selection_display()
+                return
+            if show_message:
+                messagebox.showinfo("Info", "No compatible recovery action was detected for this device.")
             return
         
         recommended_names = self.ai_analysis['device_profile'].get('recommended_methods', [])
         self.selected_methods = [m for m in self.available_methods if m.name in recommended_names[:3]]  # Top 3
         
-        # Update tree display
-        for item in self.method_tree.get_children():
-            method_name = self.method_tree.item(item)['values'][0].replace('✓ ', '')
-            if any(m.name == method_name for m in self.selected_methods):
-                self.method_tree.set(item, 'Method', f"✓ {method_name}")
-            else:
-                self.method_tree.set(item, 'Method', method_name)
+        self._mark_selected_methods()
         
         self.update_selection_display()
     
@@ -419,12 +438,20 @@ REQUIREMENTS
         """Clear all selected methods"""
         self.selected_methods = []
         
-        # Update tree display
-        for item in self.method_tree.get_children():
-            method_name = self.method_tree.item(item)['values'][0].replace('✓ ', '')
-            self.method_tree.set(item, 'Method', method_name)
+        self._mark_selected_methods()
         
         self.update_selection_display()
+
+    def _mark_selected_methods(self):
+        """Keep the method table labels in sync with the current selection."""
+        selected_names = {method.name for method in self.selected_methods}
+        for item in self.method_tree.get_children():
+            method_name = str(self.method_tree.item(item)['values'][0]).replace('✓ ', '')
+            self.method_tree.set(
+                item,
+                'Method',
+                f"✓ {method_name}" if method_name in selected_names else method_name,
+            )
     
     def update_selection_display(self):
         """Update the selection display"""

@@ -11,6 +11,7 @@ import logging
 import sys
 import os
 import shutil
+import threading
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 import json
@@ -24,11 +25,11 @@ class DeviceInfo:
     serial: str
     model: str
     manufacturer: str
-    android_version: str
-    sdk_version: str
-    bootloader_version: str
-    frp_status: str
-    connection_type: str  # adb, fastboot, download, modem
+    android_version: str = "unknown"
+    sdk_version: str = "unknown"
+    bootloader_version: str = "unknown"
+    frp_status: str = "unknown"
+    connection_type: str = "unknown"  # adb, fastboot, download, modem
     chipset: str = "unknown"
     imei: str = ""
     brand: str = "unknown"
@@ -62,17 +63,26 @@ class DeviceInfo:
 class DeviceManager:
     """Manages device detection and communication"""
     
-    def __init__(self, config):
+    def __init__(self, config=None):
         self.config = config
         self.logger = logging.getLogger(__name__)
         self.adb_path = self._find_adb_binary()
         self.fastboot_path = self._find_fastboot_binary()
         self.connected_devices: List[DeviceInfo] = []
+        self._scan_lock = threading.RLock()
+        self._scan_paused = False
+        self._last_scan_time = 0.0
+        self._pause_check_interval = 3.0
+        self._paused_device_serial = ""
         
     def _find_adb_binary(self) -> Optional[Path]:
         """Find ADB binary in system PATH or bundled tools"""
         # Check bundled tools first
         bundled_adb = Path(__file__).parent.parent.parent / "tools" / "adb"
+        if sys.platform == "win32":
+            bundled_adb_exe = bundled_adb.with_suffix(".exe")
+            if bundled_adb_exe.exists():
+                return bundled_adb_exe
         if bundled_adb.exists():
             return bundled_adb
         
@@ -101,6 +111,10 @@ class DeviceManager:
         """Find fastboot binary in system PATH or bundled tools"""
         # Check bundled tools first
         bundled_fastboot = Path(__file__).parent.parent.parent / "tools" / "fastboot"
+        if sys.platform == "win32":
+            bundled_fastboot_exe = bundled_fastboot.with_suffix(".exe")
+            if bundled_fastboot_exe.exists():
+                return bundled_fastboot_exe
         if bundled_fastboot.exists():
             return bundled_fastboot
         
@@ -126,34 +140,89 @@ class DeviceManager:
         return None
     
     def scan_devices(self) -> List[DeviceInfo]:
-        """Scan for connected Android devices"""
-        self.logger.info("Scanning for connected devices...")
-        devices = []
-        
-        # Scan ADB devices
-        adb_devices = self._scan_adb_devices()
-        devices.extend(adb_devices)
-        
-        # Scan fastboot devices
-        fastboot_devices = self._scan_fastboot_devices()
-        devices.extend(fastboot_devices)
-        
-        # Scan download mode devices (placeholder for future implementation)
-        download_devices = self._scan_download_mode_devices()
-        devices.extend(download_devices)
-        
-        # Update connected_devices BEFORE modem scan so matching works correctly
-        self.connected_devices = devices
-        
-        # Scan Samsung modems (merged into existing devices if matched)
-        modem_devices = self.scan_samsung_modems()
-        devices.extend(modem_devices)
-        
-        # Final update with any new modem-only devices
-        self.connected_devices = devices
-        self.logger.info(f"Found {len(devices)} connected device(s)")
-        
-        return devices
+        """Scan for connected Android devices while pausing after one is found."""
+        if not self._scan_lock.acquire(blocking=False):
+            return list(self.connected_devices)
+
+        try:
+            now = time.monotonic()
+
+            if self._scan_paused:
+                if now - self._last_scan_time < self._pause_check_interval:
+                    self.logger.debug(
+                        "Scan paused while a device connection is active; waiting before checking again"
+                    )
+                    return list(self.connected_devices)
+
+                if self._paused_device_serial and self._is_device_connected(self._paused_device_serial):
+                    self.logger.debug(
+                        f"Selected device {self._paused_device_serial} is still connected"
+                    )
+                    return list(self.connected_devices)
+
+                self.logger.info("Previously selected device disappeared; resuming full discovery")
+                self._scan_paused = False
+                self._paused_device_serial = ""
+            else:
+                self.logger.info("Scanning for connected devices...")
+
+            devices = []
+
+            # Scan ADB devices
+            adb_devices = self._scan_adb_devices()
+            devices.extend(adb_devices)
+
+            # Scan fastboot devices
+            fastboot_devices = self._scan_fastboot_devices()
+            devices.extend(fastboot_devices)
+
+            # Scan download mode devices (placeholder for future implementation)
+            download_devices = self._scan_download_mode_devices()
+            devices.extend(download_devices)
+
+            # Scan MTP/file-transfer devices so locked phones still appear in the UI.
+            mtp_devices = self._scan_mtp_devices()
+            devices.extend(mtp_devices)
+
+            # Update connected_devices BEFORE modem scan so matching works correctly
+            self.connected_devices = devices
+
+            # Scan Samsung modems (merged into existing devices if matched)
+            modem_devices = self.scan_samsung_modems()
+            devices.extend(modem_devices)
+
+            # Final update with any new modem-only devices
+            self.connected_devices = devices
+            self._last_scan_time = now
+
+            if devices:
+                self._paused_device_serial = next(
+                    (device.serial for device in devices if getattr(device, "serial", "")),
+                    "",
+                )
+                self.logger.info(
+                    "Device connection detected; pausing further scans until it disconnects"
+                )
+                self._scan_paused = True
+            else:
+                self._paused_device_serial = ""
+                self.logger.info("No connected device found; resuming discovery")
+                self._scan_paused = False
+
+            self.logger.info(f"Found {len(devices)} connected device(s)")
+            return devices
+        finally:
+            self._scan_lock.release()
+
+    def get_connected_devices(self, refresh: bool = True) -> List[DeviceInfo]:
+        """Return connected devices, refreshing by default for live UI/API callers."""
+        if refresh or not self.connected_devices:
+            return self.scan_devices()
+        return list(self.connected_devices)
+
+    def refresh_devices(self) -> List[DeviceInfo]:
+        """Compatibility wrapper used by GUI refresh actions."""
+        return self.scan_devices()
     
     def _scan_adb_devices(self) -> List[DeviceInfo]:
         """Scan for ADB-connected devices"""
@@ -353,6 +422,117 @@ class DeviceManager:
         # MediaTek Download Mode, Qualcomm EDL mode, etc.
         # For now, return empty list
         return []
+
+    def _scan_mtp_devices(self) -> List[DeviceInfo]:
+        """Scan for Android phones visible only as USB/MTP devices."""
+        devices: List[DeviceInfo] = []
+        try:
+            result = subprocess.run(["lsusb"], capture_output=True, text=True, timeout=10)
+        except Exception as e:
+            self.logger.error(f"Error scanning MTP devices: {e}")
+            return devices
+
+        if result.returncode != 0:
+            return devices
+
+        for line in result.stdout.splitlines():
+            lower = line.lower()
+            if any(x in lower for x in ('download mode', 'odin', 'preloader', '9008', 'fastboot', 'bootloader')):
+                continue
+            if 'webcam' in lower or 'camera' in lower:
+                continue
+            if not any(x in lower for x in (
+                'mtp', 'media', 'phone', 'android',
+                'motorola', 'moto', '22b8',
+                'samsung', '04e8',
+                'tcl', 'alcatel', 'tracfone', '1bbb',
+            )):
+                continue
+
+            parts = line.split()
+            if len(parts) < 6:
+                continue
+
+            bus = parts[1]
+            devnum = parts[3].rstrip(':')
+            id_token = None
+            for index, part in enumerate(parts):
+                if part == 'ID' and index + 1 < len(parts):
+                    id_token = parts[index + 1]
+                    break
+            if not id_token or ':' not in id_token:
+                continue
+
+            vid = id_token.split(':', 1)[0].lower()
+            manufacturer = self._get_manufacturer_from_vid(vid)
+            try:
+                device_name = ' '.join(parts[parts.index(id_token) + 1:])
+            except ValueError:
+                device_name = ''
+            if manufacturer == 'TCL' and not device_name:
+                device_name = 'TCL / Alcatel / TracFone USB Device'
+
+            self.logger.info(f"Found potential MTP device via lsusb: {line}")
+            serial = f"usb_{bus}_{devnum}_{id_token.replace(':', '_').lower()}"
+            devices.append(DeviceInfo(
+                serial=serial,
+                model=device_name or "Unknown MTP Device",
+                manufacturer=manufacturer,
+                android_version="Unknown",
+                sdk_version="Unknown",
+                bootloader_version="Unknown",
+                frp_status="Unknown",
+                connection_type="mtp",
+                chipset="unknown",
+                imei="",
+                brand=manufacturer,
+                bootloader_status="Unknown",
+                root_status="Unknown",
+                product="unknown",
+                device=device_name or line,
+                modem_port=serial,
+            ))
+
+        return devices
+
+    def _get_manufacturer_from_vid(self, vid: str) -> str:
+        """Map common Android USB vendor IDs to manufacturers."""
+        vendor_map = {
+            '04e8': 'Samsung',
+            '0bb4': 'HTC',
+            '22b8': 'Motorola',
+            '18d1': 'Google',
+            '0fce': 'Sony',
+            '04ee': 'LG',
+            '1bbb': 'TCL',
+            '05c6': 'Qualcomm',
+            '0e8d': 'MediaTek',
+            '2a96': 'Xiaomi',
+            '2717': 'Xiaomi',
+            '0b05': 'Asus',
+            '2207': 'Unisoc',
+        }
+        return vendor_map.get(vid.lower(), 'Unknown')
+
+    def _is_device_connected(self, serial: str) -> bool:
+        """Perform a lightweight connection check for a known ADB device serial."""
+        if not serial or not self.adb_path:
+            return False
+
+        try:
+            result = subprocess.run(
+                [str(self.adb_path), "-s", serial, "get-state"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            return result.returncode == 0 and result.stdout.strip().lower() in {
+                "device",
+                "recovery",
+                "unauthorized",
+            }
+        except Exception:
+            return False
     
     def _get_adb_device_info(self, serial: str, metadata: Dict[str, str] = None) -> Optional[DeviceInfo]:
         """Get detailed information for an ADB device"""

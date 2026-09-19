@@ -28,7 +28,7 @@ class DeviceInfo:
     sdk_version: str
     bootloader_version: str
     frp_status: str
-    connection_type: str  # adb, fastboot, download, modem
+    connection_type: str  # adb, adb_unauthorized, adb_restricted, fastboot, download, modem
     chipset: str = "unknown"
     imei: str = ""
     brand: str = "unknown"
@@ -58,6 +58,26 @@ class DeviceInfo:
             "bootloader_status": self.bootloader_status,
             "root_status": self.root_status
         }
+
+
+def describe_connection_capabilities(device: DeviceInfo, hardware_methods_enabled: bool = False) -> Dict[str, object]:
+    """Return transport-level capability facts without invoking AI or device writes."""
+    connection_type = (device.connection_type or "unknown").lower()
+    android_version = (device.android_version or "").strip().lower()
+
+    return {
+        "connection_type": connection_type,
+        "adb_available": connection_type == "adb",
+        "fastboot_available": connection_type == "fastboot",
+        "download_mode": connection_type == "download",
+        "interface_access": "available" if connection_type == "adb" else "limited",
+        "hardware_methods_enabled": bool(hardware_methods_enabled),
+        "ai_metadata_sufficient": (
+            connection_type == "adb"
+            and android_version not in {"", "unknown", "none", "n/a"}
+        ),
+    }
+
 
 class DeviceManager:
     """Manages device detection and communication"""
@@ -138,7 +158,7 @@ class DeviceManager:
         fastboot_devices = self._scan_fastboot_devices()
         devices.extend(fastboot_devices)
         
-        # Scan download mode devices (placeholder for future implementation)
+        # Scan Samsung Download/Odin mode devices via Heimdall
         download_devices = self._scan_download_mode_devices()
         devices.extend(download_devices)
         
@@ -348,11 +368,57 @@ class DeviceManager:
         return new_devices
 
     def _scan_download_mode_devices(self) -> List[DeviceInfo]:
-        """Scan for devices in download mode (placeholder)"""
-        # This would implement detection for Samsung Download Mode,
-        # MediaTek Download Mode, Qualcomm EDL mode, etc.
-        # For now, return empty list
-        return []
+        """Detect Samsung devices in Download/Odin mode using Heimdall."""
+        devices = []
+
+        heimdall = shutil.which("heimdall")
+        if not heimdall:
+            self.logger.debug("Heimdall not found in PATH")
+            return devices
+
+        try:
+            result = subprocess.run(
+                [heimdall, "detect"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            output = (result.stdout + result.stderr).strip()
+            self.logger.debug(f"Heimdall detect output: {output}")
+
+            if "Device detected" not in output:
+                return devices
+
+            devices.append(DeviceInfo(
+                serial="samsung-download",
+                model="Samsung Download Mode",
+                manufacturer="Samsung",
+                android_version="Unknown",
+                sdk_version="unknown",
+                bootloader_version="unknown",
+                frp_status="unknown",
+                connection_type="download",
+                chipset="unknown",
+                brand="Samsung",
+                bootloader_status="unknown",
+                root_status="unknown",
+                product="Samsung",
+                device="Odin/Heimdall Download Mode"
+            ))
+
+            self.logger.info(
+                "Samsung Download Mode device detected via Heimdall"
+            )
+
+        except subprocess.TimeoutExpired:
+            self.logger.error("Heimdall detection timed out")
+        except Exception as e:
+            self.logger.error(
+                f"Error detecting Download Mode device: {e}"
+            )
+
+        return devices
     
     def _get_adb_device_info(self, serial: str, metadata: Dict[str, str] = None) -> Optional[DeviceInfo]:
         """Get detailed information for an ADB device"""

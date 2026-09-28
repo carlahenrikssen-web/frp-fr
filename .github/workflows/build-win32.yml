@@ -8,9 +8,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          architecture: 'x86'
-      - run: pip install -r requirements.txt pyinstaller
+          python-version: '3.12'        # py3.12 still has win32 wheels for cryptography
+          architecture: 'x86'          # 32-bit Python
+      - run: python -m pip install --upgrade pip wheel setuptools
+      - run: pip install --only-binary=cryptography cryptography==43.0.3   # pinned known-good win32 wheel
+      - run: pip install --only-binary=:all: -r requirements.txt pyinstaller
       - run: pyinstaller --onefile --windowed --name FRP-Freedom --add-data "config.yaml;." main.py
       - uses: actions/upload-artifact@v4
         with:
